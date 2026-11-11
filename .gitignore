@@ -1,0 +1,5 @@
+/target
+*.freecut
+*.flowcut
+assets/*.ttf
+/FlowCut-src.zip

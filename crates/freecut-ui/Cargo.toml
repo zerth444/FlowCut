@@ -1,0 +1,20 @@
+[package]
+name = "freecut-ui"
+description = "FreeCut UI: egui-based interface, timeline, panels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+freecut-core = { path = "../freecut-core" }
+freecut-media = { path = "../freecut-media" }
+freecut-audio = { path = "../freecut-audio" }
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "wgpu", "accesskit"] }
+egui = "0.37"
+image = { version = "0.25", default-features = false, features = ["png"] }
+rfd = "0.15"
+tracing = "0.1"
+
+[lints]
+workspace = true
