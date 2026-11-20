@@ -34,6 +34,7 @@ impl Default for ExportSettings {
 #[serde(default)]
 pub struct Settings {
     pub recents: Vec<PathBuf>,
+    pub start_empty: bool,
     pub export_dir: Option<PathBuf>,
     pub export: ExportSettings,
 }

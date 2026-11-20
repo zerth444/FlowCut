@@ -970,8 +970,7 @@ fn track_row(
 }
 
 /// Применить перетаскивание края клипа (тримминг): меняет track_start/source_in
-/// или source_duration с ограничениями по границам ассета; дорожка уплотняется
-/// магнитно после каждого шага.
+/// или source_duration с ограничениями по границам ассета и привязкой к плейхеду.
 #[allow(clippy::too_many_arguments)]
 fn apply_trim(
     st: &mut UiState,
@@ -991,8 +990,23 @@ fn apply_trim(
     }
     let min_content = 0.05_f64.min(trim.orig_source_duration);
     let t = x_to_time(pps, scroll, lanes_left, pointer_x);
-    let dt = t - trim.anchor_t;
     let speed = trim.speed.max(0.01);
+    let original_edge = match side {
+        TrimSide::Left => trim.orig_track_start,
+        TrimSide::Right => trim.orig_track_start + trim.orig_source_duration / speed,
+    };
+    let requested_edge = original_edge + t - trim.anchor_t;
+    let edge = if (requested_edge - st.playhead).abs() * pps <= 10.0 {
+        st.playhead
+    } else {
+        requested_edge
+    };
+    let dt = edge - original_edge;
+    let old_end = st
+        .doc
+        .timeline
+        .find_clip(clip_id)
+        .map_or(original_edge, |clip| clip.end());
 
     match side {
         TrimSide::Left => {
@@ -1022,9 +1036,20 @@ fn apply_trim(
             });
         }
     }
-    // Магнит: зазоров не оставляем, последующие клипы подъезжают.
-    if side == TrimSide::Right {
-        st.repack_track(clip_id);
+    if side == TrimSide::Right
+        && st.doc.timeline.magnetic
+        && let Some(track) = st
+            .doc
+            .timeline
+            .tracks
+            .iter_mut()
+            .find(|track| track.clips.iter().any(|clip| clip.id == clip_id))
+        && let Some(index) = track.clips.iter().position(|clip| clip.id == clip_id)
+    {
+        let delta = track.clips[index].end() - old_end;
+        for clip in &mut track.clips[index + 1..] {
+            clip.track_start += delta;
+        }
     }
 }
 
@@ -1158,6 +1183,96 @@ mod tests {
     use super::*;
     use egui::{Event, Modifiers, PointerButton, RawInput};
     use freecut_core::{Asset, AssetKind};
+
+    #[test]
+    fn trim_snaps_both_edges_to_playhead_at_different_speeds_and_zoom() {
+        for magnetic in [false, true] {
+            for speed in [0.5, 1.0, 2.0] {
+                for pps in [20.0, 100.0, 1200.0] {
+                    for side in [TrimSide::Left, TrimSide::Right] {
+                        let mut st = UiState::new();
+                        let mut asset = Asset::new(AssetKind::Video, "test.mp4".into());
+                        asset.duration = 20.0;
+                        let asset_id = asset.id;
+                        st.doc.assets.push(asset);
+                        let track = st.doc.timeline.tracks[0].id;
+                        let id = st.insert_clip(asset_id, track, f64::INFINITY).unwrap();
+                        st.update_clip(id, |clip| {
+                            clip.track_start = 5.0;
+                            clip.source_duration = 10.0;
+                            clip.speed = speed;
+                        });
+                        st.doc.timeline.magnetic = magnetic;
+                        let clip = st.doc.timeline.find_clip(id).unwrap().clone();
+                        let original = if side == TrimSide::Left {
+                            clip.track_start
+                        } else {
+                            clip.end()
+                        };
+                        let target = if side == TrimSide::Left {
+                            original + 2.0
+                        } else {
+                            original - 2.0
+                        };
+                        st.seek(target);
+                        let anchor = original + 3.0 / pps;
+                        st.begin_trim(TrimState {
+                            clip_id: id,
+                            side,
+                            anchor_t: anchor,
+                            orig_track_start: clip.track_start,
+                            orig_source_in: clip.source_in,
+                            orig_source_duration: clip.source_duration,
+                            speed,
+                            min_start: 0.0,
+                            max_end: f64::INFINITY,
+                        });
+                        // Grab three pixels inside the handle and stop five pixels from the playhead.
+                        let pointer_time = anchor + target - original + 5.0 / pps;
+                        apply_trim(
+                            &mut st,
+                            id,
+                            side,
+                            (pointer_time * pps) as f32,
+                            pps,
+                            0.0,
+                            0.0,
+                            20.0,
+                        );
+                        let result = st.doc.timeline.find_clip(id).unwrap();
+                        let edge = if side == TrimSide::Left {
+                            result.track_start
+                        } else {
+                            result.end()
+                        };
+                        assert!(
+                            (edge - target).abs() < 1e-6,
+                            "{side:?}, speed={speed}, pps={pps}, magnetic={magnetic}"
+                        );
+                        // Continuing beyond the snap radius releases the edge.
+                        let pointer_time = anchor + target - original + 20.0 / pps;
+                        apply_trim(
+                            &mut st,
+                            id,
+                            side,
+                            (pointer_time * pps) as f32,
+                            pps,
+                            0.0,
+                            0.0,
+                            20.0,
+                        );
+                        let result = st.doc.timeline.find_clip(id).unwrap();
+                        let edge = if side == TrimSide::Left {
+                            result.track_start
+                        } else {
+                            result.end()
+                        };
+                        assert!((edge - target - 20.0 / pps).abs() < 1e-5);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn free_trim_moves_left_edge_and_keeps_right_edge() {

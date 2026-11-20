@@ -4,11 +4,17 @@
 fn main() -> eframe::Result {
     install_tracing();
 
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_title("FlowCut")
+        .with_inner_size([1440.0, 900.0])
+        .with_min_inner_size([1024.0, 640.0]);
+    match eframe::icon_data::from_png_bytes(include_bytes!("../assets/flowcut.png")) {
+        Ok(icon) => viewport = viewport.with_icon(icon),
+        Err(error) => tracing::warn!(%error, "не удалось загрузить иконку окна"),
+    }
+
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("FlowCut")
-            .with_inner_size([1440.0, 900.0])
-            .with_min_inner_size([1024.0, 640.0]),
+        viewport,
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };

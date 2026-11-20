@@ -13,6 +13,87 @@ use freecut_core::{
 use crate::app::UiState;
 use crate::theme::Palette;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use freecut_core::{Document, new_id};
+
+    #[test]
+    fn close_button_only_prompts_when_project_has_unsaved_changes() {
+        for dirty in [false, true] {
+            let mut st = UiState::new();
+            st.project.data = std::env::temp_dir().join(format!("flowcut-close-test-{}", new_id()));
+            st.dirty = dirty;
+            let mut input = egui::RawInput::default();
+            input
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .events
+                .push(egui::ViewportEvent::Close);
+            let mut output =
+                Context::default().run_ui(input, |ui| ProjectUi::handle_close(&mut st, ui.ctx()));
+            output.textures_delta.clear();
+            assert_eq!(
+                matches!(st.project.confirmation, Some(ProjectAction::Close)),
+                dirty
+            );
+            assert_eq!(
+                output.viewport_output[&egui::ViewportId::ROOT]
+                    .commands
+                    .contains(&egui::ViewportCommand::CancelClose),
+                dirty
+            );
+        }
+    }
+
+    #[test]
+    fn discard_exit_starts_empty_and_keeps_saved_project_in_recents() -> std::io::Result<()> {
+        let data = std::env::temp_dir().join(format!("flowcut-startup-test-{}", new_id()));
+        let result = (|| {
+            let path = data.join("saved.flowcut");
+            let document = Document {
+                name: "Saved project".into(),
+                ..Document::default()
+            };
+            project::write_json(&path, &document)?;
+            let mut st = UiState::new();
+            st.project.data.clone_from(&data);
+            st.project.remember(path.clone())?;
+            ProjectUi::restore(&mut st);
+            assert_eq!(st.doc.name, "Saved project");
+            st.doc.name = "Unsaved edit".into();
+            st.dirty = true;
+            project::write_json(
+                &data.join("recovery.json"),
+                &Recovery {
+                    project_path: Some(path.clone()),
+                    document: st.doc.clone(),
+                },
+            )?;
+
+            ProjectUi::close(&mut st, &Context::default(), true);
+            assert!(st.project.closing);
+            let mut reopened = UiState::new();
+            reopened.project.data.clone_from(&data);
+            ProjectUi::restore(&mut reopened);
+            assert!(reopened.doc.name.is_empty());
+            assert!(reopened.project.path.is_none());
+            assert_eq!(
+                reopened.project.settings.recents,
+                std::slice::from_ref(&path)
+            );
+            assert_eq!(project::open(&path)?.name, "Saved project");
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(data.join("saved.flowcut"));
+        let _ = std::fs::remove_file(data.join("settings.json"));
+        let _ = std::fs::remove_file(data.join("recovery.json"));
+        let _ = std::fs::remove_dir(data);
+        result
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum ProjectAction {
     Save,
@@ -87,6 +168,9 @@ impl ProjectUi {
             st.notice = Some("Восстановлены несохранённые изменения".into());
             return;
         }
+        if project.settings.start_empty {
+            return;
+        }
         for path in &project.settings.recents {
             if let Ok(doc) = project::open(path) {
                 st.doc = doc;
@@ -116,11 +200,14 @@ impl ProjectUi {
         if ctx.input(|i| i.viewport().close_requested()) {
             if st.project.closing && st.project.export.is_some() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            } else if !st.project.closing {
+            } else if !st.project.closing && st.dirty {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 st.project.confirmation = Some(ProjectAction::Close);
                 st.playing = false;
                 ctx.request_repaint();
+            } else if st.project.export.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                Self::close(st, ctx, st.project.settings.start_empty);
             } else {
                 st.project.clear_recovery();
             }
@@ -139,7 +226,7 @@ impl ProjectUi {
                 _ => replaced = Self::perform(st, ctx, action),
             }
         }
-        if st.dirty {
+        if st.dirty && !st.project.closing {
             let interval = std::time::Duration::from_secs(20);
             if st.project.autosave.elapsed() >= interval {
                 st.project.autosave = Instant::now();
@@ -220,14 +307,7 @@ impl ProjectUi {
             ProjectAction::OpenRecent(path) => Some(path),
             ProjectAction::New => None,
             ProjectAction::Close => {
-                st.project.clear_recovery();
-                st.project.closing = true;
-                if let Some(export) = &st.project.export {
-                    export.cancel.store(true, Ordering::Relaxed);
-                    st.notice = Some("Останавливаем экспорт перед закрытием…".into());
-                } else {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+                Self::close(st, ctx, false);
                 return false;
             }
             ProjectAction::Save | ProjectAction::Relink(_) => return false,
@@ -248,6 +328,26 @@ impl ProjectUi {
             st.notice = Some(format!("Настройки: {error}"));
         }
         true
+    }
+
+    fn close(st: &mut UiState, ctx: &Context, start_empty: bool) {
+        let previous = st.project.settings.start_empty;
+        st.project.settings.start_empty = start_empty;
+        if previous != start_empty
+            && let Err(error) = st.project.save_settings()
+        {
+            st.project.settings.start_empty = previous;
+            st.notice = Some(format!("Не удалось сохранить настройки запуска: {error}"));
+            return;
+        }
+        st.project.clear_recovery();
+        st.project.closing = true;
+        if let Some(export) = &st.project.export {
+            export.cancel.store(true, Ordering::Relaxed);
+            st.notice = Some("Останавливаем экспорт перед закрытием…".into());
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 
     fn relink(st: &mut UiState, id: Id) -> bool {
@@ -306,7 +406,7 @@ impl ProjectUi {
                         && Self::save(st)
                     {
                         replaced = Self::perform(st, ui.ctx(), action.clone());
-                        keep = false;
+                        keep = closing && !st.project.closing;
                     }
                     if ui
                         .button(if closing {
@@ -316,8 +416,13 @@ impl ProjectUi {
                         })
                         .clicked()
                     {
-                        replaced = Self::perform(st, ui.ctx(), action.clone());
-                        keep = false;
+                        if closing {
+                            Self::close(st, ui.ctx(), true);
+                            keep = !st.project.closing;
+                        } else {
+                            replaced = Self::perform(st, ui.ctx(), action.clone());
+                            keep = false;
+                        }
                     }
                     if ui
                         .button(if closing {
