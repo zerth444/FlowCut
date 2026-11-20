@@ -35,8 +35,19 @@ struct FrameKey {
 
 type ImportResult = Result<(Asset, Option<egui::ColorImage>), String>;
 
+#[derive(Clone, Copy)]
+pub(crate) struct TimelineDrop {
+    pub track_id: Id,
+    pub time: f64,
+}
+
+struct ImportBatch {
+    paths: Vec<PathBuf>,
+    destination: Option<TimelineDrop>,
+}
+
 enum ImportEvent {
-    Asset(ImportResult),
+    Assets(Vec<ImportResult>, Option<TimelineDrop>),
     Waveform(Id, egui::ColorImage),
 }
 
@@ -247,7 +258,7 @@ pub struct UiState {
     /// Редактирование имени проекта в верхней панели.
     pub renaming: bool,
     /// Файлы, ожидающие импорта.
-    pub pending_import: Vec<std::path::PathBuf>,
+    pending_import: Vec<ImportBatch>,
     /// Открыть системный диалог импорта в начале следующего кадра (кнопка/Ctrl+I).
     pub want_import: bool,
     /// Миниатюры ассетов (кадр, снятый при импорте), по id ассета.
@@ -596,6 +607,50 @@ impl UiState {
             .find(|t| t.kind == track_kind && !t.video_sound)
             .map(|t| t.id)?;
         self.insert_clip(asset_id, track_id, f64::INFINITY)
+    }
+
+    fn insert_dropped_asset(
+        &mut self,
+        asset_id: Id,
+        destination: TimelineDrop,
+        next_starts: &mut HashMap<Id, f64>,
+    ) {
+        let Some(asset) = self.doc.asset(asset_id) else {
+            return;
+        };
+        let kind = if asset.kind == AssetKind::Audio {
+            TrackKind::Audio
+        } else {
+            TrackKind::Video
+        };
+        let eligible = |track: &&Track| track.kind == kind && !track.video_sound && !track.locked;
+        let Some(track_id) = self
+            .doc
+            .timeline
+            .tracks
+            .iter()
+            .filter(eligible)
+            .find(|track| track.id == destination.track_id)
+            .or_else(|| self.doc.timeline.tracks.iter().find(eligible))
+            .map(|track| track.id)
+        else {
+            return;
+        };
+        let start = next_starts
+            .get(&track_id)
+            .copied()
+            .unwrap_or(destination.time);
+        // Свободная вставка принимает координату центра, магнитная — точку вставки.
+        let target = if self.doc.timeline.magnetic {
+            start
+        } else {
+            start + asset.duration * 0.5
+        };
+        if let Some(id) = self.insert_clip(asset_id, track_id, target)
+            && let Some(clip) = self.doc.timeline.find_clip(id)
+        {
+            next_starts.insert(track_id, clip.end());
+        }
     }
 
     /// Изменить клип по id (и пометить документ грязным).
@@ -1108,17 +1163,31 @@ impl FlowCutApp {
         if let Some(rx) = &self.imports {
             loop {
                 match rx.try_recv() {
-                    Ok(ImportEvent::Asset(Ok((asset, thumbnail)))) => {
-                        if let Some(image) = thumbnail {
-                            let name = format!("thumb_{}", asset.id.simple());
-                            let tex =
-                                ctx.load_texture(name, image, egui::TextureOptions::default());
-                            self.st.thumbs.insert(asset.id, tex);
+                    Ok(ImportEvent::Assets(results, destination)) => {
+                        let mut next_starts = HashMap::new();
+                        for result in results {
+                            match result {
+                                Ok((asset, thumbnail)) => {
+                                    let id = asset.id;
+                                    if let Some(image) = thumbnail {
+                                        self.st
+                                            .thumbs
+                                            .insert(id, artwork_texture(ctx, id, "thumb", image));
+                                    }
+                                    self.st.doc.assets.push(asset);
+                                    self.st.dirty = true;
+                                    if let Some(destination) = destination {
+                                        self.st.insert_dropped_asset(
+                                            id,
+                                            destination,
+                                            &mut next_starts,
+                                        );
+                                    }
+                                }
+                                Err(error) => self.st.notice = Some(error),
+                            }
                         }
-                        self.st.doc.assets.push(asset);
-                        self.st.dirty = true;
                     }
-                    Ok(ImportEvent::Asset(Err(error))) => self.st.notice = Some(error),
                     Ok(ImportEvent::Waveform(id, image)) => {
                         self.st
                             .waves
@@ -1142,31 +1211,35 @@ impl FlowCutApp {
             self.st.pending_import.clear();
             return;
         }
-        let paths = std::mem::take(&mut self.st.pending_import);
+        let batches = std::mem::take(&mut self.st.pending_import);
         let (tx, rx) = std::sync::mpsc::channel();
         let repaint = ctx.clone();
         match std::thread::Builder::new()
             .name("flowcut_import".into())
             .spawn(move || {
-                for path in paths {
-                    let asset = import_asset(path);
-                    let audio = asset
-                        .as_ref()
-                        .ok()
+                for batch in batches {
+                    let results: Vec<_> = batch.paths.into_iter().map(import_asset).collect();
+                    let audio: Vec<_> = results
+                        .iter()
+                        .filter_map(|result| result.as_ref().ok())
                         .map(|(asset, _)| asset)
                         .filter(|asset| asset.has_audio)
-                        .cloned();
-                    if tx.send(ImportEvent::Asset(asset)).is_err() {
-                        break;
+                        .cloned()
+                        .collect();
+                    if tx
+                        .send(ImportEvent::Assets(results, batch.destination))
+                        .is_err()
+                    {
+                        return;
                     }
                     repaint.request_repaint();
-                    if let Some(asset) = audio
-                        && let Some(image) = asset_waveform(&asset)
-                    {
-                        if tx.send(ImportEvent::Waveform(asset.id, image)).is_err() {
-                            break;
+                    for asset in audio {
+                        if let Some(image) = asset_waveform(&asset) {
+                            if tx.send(ImportEvent::Waveform(asset.id, image)).is_err() {
+                                return;
+                            }
+                            repaint.request_repaint();
                         }
-                        repaint.request_repaint();
                     }
                 }
                 drop(tx);
@@ -1315,6 +1388,27 @@ impl FlowCutApp {
 }
 
 impl eframe::App for FlowCutApp {
+    #[cfg(windows)]
+    fn raw_input_hook(&mut self, ctx: &Context, input: &mut egui::RawInput) {
+        use windows_sys::Win32::{Foundation::POINT, UI::WindowsAndMessaging::GetCursorPos};
+
+        if !input.dropped_files.is_empty()
+            && let Some(rect) = input.viewport().inner_rect
+            && let Some(native_scale) = input.viewport().native_pixels_per_point
+        {
+            // OLE передаёт winit файл, но при внешнем перетаскивании не обновляет
+            // обычные события движения курсора окна.
+            let mut point = POINT { x: 0, y: 0 };
+            // GetCursorPos записывает данные в валидный указатель на POINT.
+            if unsafe { GetCursorPos(&mut point) } != 0 {
+                let scale = native_scale * ctx.zoom_factor();
+                let pos =
+                    egui::pos2(point.x as f32 / scale, point.y as f32 / scale) - rect.min.to_vec2();
+                input.events.push(egui::Event::PointerMoved(pos));
+            }
+        }
+    }
+
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         ProjectUi::handle_close(&mut self.st, ctx);
     }
@@ -1337,10 +1431,6 @@ impl FlowCutApp {
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect()
         });
-        if !dropped.is_empty() {
-            tracing::info!(count = dropped.len(), "перетащены файлы");
-            self.st.pending_import.extend(dropped);
-        }
 
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick).as_secs_f64();
@@ -1369,11 +1459,13 @@ impl FlowCutApp {
                 )
                 .pick_files();
             if let Some(paths) = picked {
-                self.st.pending_import.extend(paths);
+                self.st.pending_import.push(ImportBatch {
+                    paths,
+                    destination: None,
+                });
             }
         }
 
-        self.update_imports(&ctx);
         self.poll_thumbnails(&ctx);
 
         // Payload перетаскивания из медиатеки живёт ровно пока тянем мышь:
@@ -1395,7 +1487,16 @@ impl FlowCutApp {
         // верхней, поэтому таймлайн добавляем до боковых панелей.
         widgets::top_bar::show(ui, &mut self.st);
         widgets::top_bar::status(ui, &mut self.st);
-        widgets::timeline::show(ui, &mut self.st);
+        let destination = widgets::timeline::show(ui, &mut self.st);
+        if !dropped.is_empty() && self.st.project.confirmation.is_none() && !self.st.project.closing
+        {
+            tracing::info!(count = dropped.len(), "перетащены файлы");
+            self.st.pending_import.push(ImportBatch {
+                paths: dropped,
+                destination,
+            });
+        }
+        self.update_imports(&ctx);
         widgets::library::show(ui, &mut self.st);
         if self.st.project.export_open {
             ProjectUi::show_export(ui, &mut self.st);
@@ -1780,6 +1881,24 @@ mod tests {
         });
         key(&mut app, egui::Key::K, egui::Modifiers::NONE);
         assert!(!app.st.playing);
+
+        // Drop two native files directly onto the video lane at a later time.
+        frame(
+            &mut app,
+            egui::RawInput {
+                events: vec![egui::Event::PointerMoved(egui::pos2(450.0, 550.0))],
+                dropped_files: vec![
+                    std::sync::Arc::new(Dropped(file.clone())),
+                    std::sync::Arc::new(Dropped(file.clone())),
+                ],
+                ..Default::default()
+            },
+        );
+        wait_until(&mut app, |app| !app.st.importing);
+        let clips = &app.st.doc.timeline.tracks[0].clips;
+        assert_eq!(clips.len(), 3, "{:?}", app.st.notice);
+        assert!((3.0..4.5).contains(&clips[1].track_start));
+        assert!((clips[2].track_start - clips[1].end()).abs() < 1e-6);
         drop(app);
         // Seek worker may still be releasing the input file.
         for _ in 0..50 {

@@ -8,7 +8,7 @@ use egui::{
 use freecut_core::TrackKind;
 
 use crate::{
-    app::{AssetDragPayload, TrimSide, TrimState, UiState},
+    app::{AssetDragPayload, TimelineDrop, TrimSide, TrimState, UiState},
     icons,
     theme::{Palette, alpha},
 };
@@ -20,6 +20,7 @@ const TOOLBAR_H: f32 = 36.0;
 const RULER_H: f32 = 26.0;
 const HEADER_W: f32 = 96.0;
 const ROW_GAP: f32 = 8.0;
+const SCROLLBAR_HEIGHT: f32 = 20.0;
 const MIN_PPS: f64 = 2.0;
 const MAX_PPS: f64 = 2400.0;
 const FIT_W: f32 = 76.0;
@@ -28,7 +29,8 @@ const ZOOM_SLIDER_W: f32 = 120.0;
 
 // ------------------------------------------------------------- show / frame --
 
-pub fn show(ui: &mut Ui, st: &mut UiState) {
+pub(crate) fn show(ui: &mut Ui, st: &mut UiState) -> Option<TimelineDrop> {
+    let mut destination = None;
     egui::Panel::bottom("timeline_panel")
         .default_size(PANEL_HEIGHT)
         .min_size(214.0)
@@ -40,8 +42,11 @@ pub fn show(ui: &mut Ui, st: &mut UiState) {
             let zone = ui.available_rect_before_wrap();
             ui.vertical(|ui| {
                 toolbar(ui, st);
+                st.scroll = st
+                    .scroll
+                    .clamp(0.0, max_timeline_scroll(st, zone.width() - HEADER_W));
                 ruler_row(ui, st);
-                tracks_and_interactions(ui, st);
+                destination = tracks_and_interactions(ui, st);
             });
             if st.trim.is_some() && !ui.input(|i| i.pointer.primary_down()) {
                 st.finish_trim();
@@ -52,6 +57,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState) {
             // Колесо и Ctrl+колесо работают по всей высоте таймлайна.
             wheel_scroll_and_zoom(ui, zone, st);
         });
+    destination
 }
 
 // ------------------------------------------------------------------ toolbar --
@@ -340,15 +346,27 @@ fn time_label(t: f64, step: f64) -> String {
 
 // ------------------------------------------------------------------ дорожки --
 
-fn tracks_and_interactions(ui: &mut Ui, st: &mut UiState) {
+fn tracks_and_interactions(ui: &mut Ui, st: &mut UiState) -> Option<TimelineDrop> {
     let (area, _) = ui.allocate_exact_size(ui.available_size(), Sense::hover());
     let painter = ui.painter_at(area);
     painter.rect_filled(area, CornerRadius::same(0), Palette::BG);
+    let tracks_area = area.with_max_y(area.bottom() - SCROLLBAR_HEIGHT);
 
     let lanes_rect = Rect::from_min_max(
-        Pos2::new(area.left() + HEADER_W, area.top()),
-        Pos2::new(area.right(), area.bottom()),
+        Pos2::new(tracks_area.left() + HEADER_W, tracks_area.top()),
+        tracks_area.right_bottom(),
     );
+    let drop_pos = ui.input(|input| {
+        if input.raw.dropped_files.is_empty() {
+            None
+        } else {
+            input
+                .pointer
+                .latest_pos()
+                .filter(|pos| lanes_rect.contains(*pos))
+        }
+    });
+    let mut destination = None;
 
     // Снимок данных дорожек: рисуем по копии, но ст mutating UI-состояние.
     let snapshot: Vec<(
@@ -382,19 +400,27 @@ fn tracks_and_interactions(ui: &mut Ui, st: &mut UiState) {
         .filter(|pair| pair[0].kind == TrackKind::Video && pair[1].video_sound)
         .count();
     let gaps = ROW_GAP * (snapshot.len() - joined) as f32;
-    let height_scale = ((area.height() - gaps - 9.0) / requested_height).clamp(0.0, 1.0);
+    let height_scale = ((tracks_area.height() - gaps) / requested_height).clamp(0.0, 1.0);
     for (row_index, (track_id, kind, name, muted, clips)) in snapshot.into_iter().enumerate() {
         let row_h = match kind {
             TrackKind::Video => st.video_row_h,
             TrackKind::Audio => st.audio_row_h,
         } * height_scale;
-        if y + row_h > area.bottom() {
+        if y + row_h > tracks_area.bottom() {
             break;
         }
         let row_rect = Rect::from_min_max(
             Pos2::new(area.left(), y),
             Pos2::new(area.right(), y + row_h),
         );
+        if let Some(pos) = drop_pos
+            && row_rect.contains(pos)
+        {
+            destination = Some(TimelineDrop {
+                track_id,
+                time: x_to_time(st.pps, st.scroll, lanes_rect.left(), pos.x).max(0.0),
+            });
+        }
         track_row(
             painter.clone(),
             row_rect,
@@ -472,8 +498,9 @@ fn tracks_and_interactions(ui: &mut Ui, st: &mut UiState) {
         );
     }
 
-    draw_playhead(&painter, area, lanes_rect, st);
+    draw_playhead(&painter, tracks_area, lanes_rect, st);
     h_scrollbar(ui, &painter, area, st);
+    destination
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -666,19 +693,25 @@ fn track_row(
     for (index, clip) in clips.iter().enumerate() {
         let x0 = time_to_x(pps, scroll, lanes_rect.left(), clip.track_start);
         let x1 = time_to_x(pps, scroll, lanes_rect.left(), clip.end());
-        if x1 < lane_rect.left() + 2.0 || x0 > lane_rect.right() - 2.0 {
-            continue; // целиком за пределами видимой полосы
-        }
-        let clip_rect = Rect::from_min_max(
+        let full_clip_rect = Rect::from_min_max(
+            Pos2::new(x0, lane_rect.top() + if joined_above { 0.0 } else { 2.0 }),
             Pos2::new(
-                x0.max(lane_rect.left() + 1.0),
-                lane_rect.top() + if joined_above { 0.0 } else { 2.0 },
-            ),
-            Pos2::new(
-                x1.min(row_rect.right() - 2.0),
+                x1,
                 lane_rect.bottom() - if joined_below { 0.0 } else { 2.0 },
             ),
         );
+        let clip_rect = full_clip_rect.intersect(lane_rect);
+        if !clip_rect.is_positive() {
+            continue;
+        }
+        // Уводим скругление и внутреннюю обводку за границу видимости.
+        let mut paint_rect = clip_rect;
+        if x0 < clip_rect.left() {
+            paint_rect.min.x -= 6.0;
+        }
+        if x1 > clip_rect.right() {
+            paint_rect.max.x += 6.0;
+        }
 
         let fill = match kind {
             TrackKind::Video => Palette::VIDEO_CLIP,
@@ -687,7 +720,7 @@ fn track_row(
 
         // Тело клипа со скруглением; миниатюра не вылезает за скруглённые углы.
         let thumb_painter = painter.with_clip_rect(clip_rect);
-        thumb_painter.rect_filled(clip_rect, CornerRadius::same(5), fill);
+        thumb_painter.rect_filled(paint_rect, CornerRadius::same(5), fill);
 
         // Кадр-миниатюра слева наполном-высоте клипа, без искажений (обложка).
         let mut strip_w = 0.0_f32;
@@ -697,10 +730,10 @@ fn track_row(
             let size = tex.size_vec2();
             if size.x > 0.0 && size.y > 0.0 {
                 let h = clip_rect.height();
-                strip_w = (h * size.x / size.y).min(clip_rect.width());
+                strip_w = (h * size.x / size.y).min(full_clip_rect.width());
                 let strip = Rect::from_min_max(
-                    clip_rect.min,
-                    Pos2::new(clip_rect.left() + strip_w, clip_rect.max.y),
+                    full_clip_rect.min,
+                    Pos2::new(full_clip_rect.left() + strip_w, full_clip_rect.max.y),
                 );
                 thumb_painter.image(
                     tex.id(),
@@ -934,16 +967,16 @@ fn track_row(
 
         // Контур клипа поверх миниатюры (и выделение).
         if selected {
-            painter.rect(
-                clip_rect,
+            thumb_painter.rect(
+                paint_rect,
                 CornerRadius::same(5),
                 Color32::TRANSPARENT,
                 Stroke::new(2.0, Palette::ACCENT),
                 egui::StrokeKind::Inside,
             );
         } else {
-            painter.rect(
-                clip_rect,
+            thumb_painter.rect(
+                paint_rect,
                 CornerRadius::same(5),
                 Color32::TRANSPARENT,
                 Stroke::new(1.0, alpha(Color32::BLACK, 90)),
@@ -952,7 +985,7 @@ fn track_row(
         }
 
         // Имя ассета: правее миниатюры, компактно, не перекрывает картинку.
-        let name_x = clip_rect.left() + strip_w + 6.0;
+        let name_x = (full_clip_rect.left() + strip_w + 6.0).max(clip_rect.left() + 6.0);
         if !asset_name.is_empty() && clip_rect.right() - name_x > 56.0 {
             thumb_painter.text(
                 Pos2::new(name_x, clip_rect.bottom() - 10.0),
@@ -1115,8 +1148,12 @@ fn wheel_scroll_and_zoom(ui: &mut Ui, rect: Rect, st: &mut UiState) {
             st.scroll = (t - (anchor_x - lanes_left) as f64 / st.pps).max(0.0);
         }
     } else if dy.abs() > 0.5 || dx.abs() > 0.5 {
-        st.scroll = (st.scroll + f64::from(dy + dx) / st.pps).max(0.0);
+        let delta = if dx.abs() > 0.5 { dx } else { dy };
+        st.scroll -= f64::from(delta) / st.pps;
     }
+    st.scroll = st
+        .scroll
+        .clamp(0.0, max_timeline_scroll(st, rect.width() - HEADER_W));
 }
 
 fn draw_playhead(painter: &egui::Painter, area: Rect, lanes_rect: Rect, st: &mut UiState) {
@@ -1135,46 +1172,89 @@ fn draw_playhead(painter: &egui::Painter, area: Rect, lanes_rect: Rect, st: &mut
     );
 }
 
+fn max_timeline_scroll(st: &UiState, lane_width: f32) -> f64 {
+    (st.duration().max(st.playhead) + 30.0 - f64::from(lane_width.max(0.0)) / st.pps).max(0.0)
+}
+
 fn h_scrollbar(ui: &mut Ui, painter: &egui::Painter, area: Rect, st: &mut UiState) {
+    let lane_width = area.width() - HEADER_W;
+    let max_scroll = max_timeline_scroll(st, lane_width);
     let bar = Rect::from_min_max(
-        Pos2::new(area.left() + HEADER_W + 4.0, area.bottom() - 8.0),
-        Pos2::new(area.right() - 8.0, area.bottom() - 2.0),
-    );
-    painter.rect_filled(bar, CornerRadius::same(3), Palette::STROKE_SOFT);
-
-    let lanes_w = bar.width() as f64;
-    let content_w = ((st.duration().max(st.playhead).max(st.scroll) + 30.0) * st.pps).max(lanes_w);
-    let visible = (lanes_w / content_w).clamp(0.08, 1.0);
-    let max_scroll = (content_w - lanes_w) / st.pps;
-    let thumb_w = (lanes_w * visible) as f32;
-    let frac = if max_scroll > 0.0 {
-        (st.scroll / max_scroll).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let thumb_x = bar.left() + (bar.width() - thumb_w) * frac as f32;
-
-    painter.rect_filled(
-        Rect::from_min_max(
-            Pos2::new(thumb_x, bar.top()),
-            Pos2::new(thumb_x + thumb_w, bar.bottom()),
+        Pos2::new(
+            area.left() + HEADER_W + 4.0,
+            area.bottom() - SCROLLBAR_HEIGHT + 3.0,
         ),
-        CornerRadius::same(3),
-        Palette::STROKE,
+        Pos2::new(area.right() - 4.0, area.bottom() - 3.0),
     );
-
-    let resp = ui.interact(
-        bar,
-        ui.scope_id().with("timeline_h_scrollbar"),
-        Sense::click_and_drag(),
-    );
-    if (resp.dragged() || resp.clicked())
-        && max_scroll > 0.0
-        && let Some(pos) = resp.interact_pointer_pos()
-    {
-        let f = ((pos.x - bar.left()) / bar.width()).clamp(0.0, 1.0);
-        st.scroll = f as f64 * max_scroll;
+    if !bar.is_positive() {
+        return;
     }
+    let viewport_seconds = f64::from(lane_width) / st.pps;
+    let visible_ratio = viewport_seconds / (viewport_seconds + max_scroll);
+    let thumb_width = (bar.width() * visible_ratio as f32)
+        .max(32.0)
+        .min(bar.width());
+    let travel = bar.width() - thumb_width;
+    let left = |scroll: f64| {
+        let ratio = if max_scroll > 0.0 {
+            (scroll / max_scroll).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        bar.left() + travel * ratio as f32
+    };
+    let thumb = |scroll| {
+        Rect::from_min_size(
+            Pos2::new(left(scroll), bar.top()),
+            Vec2::new(thumb_width, bar.height()),
+        )
+    };
+    let id = ui.scope_id().with("timeline_h_scrollbar");
+    let response = ui.interact(bar, id, Sense::click_and_drag());
+    if travel > 0.0 && max_scroll > 0.0 {
+        if response.drag_started()
+            && let Some(origin) = ui.input(|input| input.pointer.press_origin())
+        {
+            let grab = if thumb(st.scroll).contains(origin) {
+                origin.x - left(st.scroll)
+            } else {
+                thumb_width * 0.5
+            };
+            ui.data_mut(|data| data.insert_temp(id, grab));
+        }
+        if let Some(pos) = response.interact_pointer_pos() {
+            let grab = if response.dragged() || response.drag_stopped() {
+                ui.data(|data| data.get_temp::<f32>(id))
+            } else if response.clicked() && !thumb(st.scroll).contains(pos) {
+                Some(thumb_width * 0.5)
+            } else {
+                None
+            };
+            if let Some(grab) = grab {
+                let ratio = ((pos.x - grab - bar.left()) / travel).clamp(0.0, 1.0);
+                st.scroll = f64::from(ratio) * max_scroll;
+                ui.ctx().request_repaint();
+            }
+        }
+        if response.hovered() || response.dragged() {
+            ui.ctx().set_cursor_icon(if response.dragged() {
+                CursorIcon::Grabbing
+            } else {
+                CursorIcon::Grab
+            });
+        }
+    }
+    painter.rect_filled(bar, 5, Palette::SURFACE_HOVER);
+    let color = if response.dragged() {
+        Palette::ACCENT
+    } else if response.hovered() && travel > 0.0 {
+        Palette::TEXT
+    } else if travel > 0.0 {
+        Palette::TEXT_DIM
+    } else {
+        Palette::TEXT_FAINT
+    };
+    painter.rect_filled(thumb(st.scroll).shrink2(Vec2::new(0.0, 2.0)), 4, color);
 }
 
 #[cfg(test)]
@@ -1183,6 +1263,42 @@ mod tests {
     use super::*;
     use egui::{Event, Modifiers, PointerButton, RawInput};
     use freecut_core::{Asset, AssetKind};
+
+    #[test]
+    fn scrollbar_keeps_grab_point_and_reaches_the_end() {
+        let mut st = UiState::new();
+        let ctx = egui::Context::default();
+        let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 200.0));
+        let start = Pos2::new(120.0, 190.0);
+        let pointer = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        let mut frame = |events| {
+            ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(area),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    h_scrollbar(ui, &ui.painter_at(area), area, &mut st);
+                },
+            )
+            .textures_delta
+            .clear();
+            st.scroll
+        };
+        frame(vec![Event::PointerMoved(start)]);
+        frame(vec![pointer(start, true)]);
+        let right = Pos2::new(980.0, start.y);
+        let max_scroll = 30.0 - f64::from(area.width() - HEADER_W) / UiState::new().pps;
+        assert!((frame(vec![Event::PointerMoved(right)]) - max_scroll).abs() < 1e-6);
+        assert!(frame(vec![Event::PointerMoved(start)]).abs() < 1e-6);
+        assert!(frame(vec![pointer(start, false)]).abs() < 1e-6);
+    }
 
     #[test]
     fn trim_snaps_both_edges_to_playhead_at_different_speeds_and_zoom() {

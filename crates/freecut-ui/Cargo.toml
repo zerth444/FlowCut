@@ -16,5 +16,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 rfd = "0.15"
 tracing = "0.1"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
+
 [lints]
 workspace = true
